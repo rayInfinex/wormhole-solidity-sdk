@@ -3,18 +3,17 @@
 pragma solidity ^0.8.0;
 
 import {WormholeSimulator} from "./WormholeSimulator.sol";
-import {toWormholeFormat} from "../../Utils.sol";
+import {toWormholeFormat, fromWormholeFormat} from "../../Utils.sol";
 import "../../interfaces/IWormholeRelayer.sol";
 import "../../interfaces/IWormhole.sol";
 import "forge-std/Vm.sol";
 import "./DeliveryInstructionDecoder.sol";
 import "./ExecutionParameters.sol";
 import "./BytesParsing.sol";
+
 using BytesParsing for bytes;
 
-
 contract MockOffchainRelayer {
-
     uint16 chainIdOfWormholeAndGuardianUtilities;
     IWormhole relayerWormhole;
     WormholeSimulator relayerWormholeSimulator;
@@ -23,9 +22,9 @@ contract MockOffchainRelayer {
 
     mapping(uint16 => address) wormholeRelayerContracts;
 
-    mapping(uint16 => uint) forks;
+    mapping(uint16 => uint256) forks;
 
-    mapping(uint => uint16) chainIdFromFork;
+    mapping(uint256 => uint16) chainIdFromFork;
 
     mapping(bytes32 => bytes[]) pastEncodedVMs;
 
@@ -38,21 +37,29 @@ contract MockOffchainRelayer {
         chainIdOfWormholeAndGuardianUtilities = relayerWormhole.chainId();
     }
 
-    function getPastEncodedVMs(
-        uint16 chainId,
-        uint64 deliveryVAASequence
-    ) public view returns (bytes[] memory) {
+    function getPastEncodedVMs(uint16 chainId, uint64 deliveryVAASequence)
+        public
+        view
+        returns (bytes[] memory)
+    {
         return pastEncodedVMs[keccak256(abi.encodePacked(chainId, deliveryVAASequence))];
     }
 
-    function getPastDeliveryVAA(
-        uint16 chainId,
-        uint64 deliveryVAASequence
-    ) public view returns (bytes memory) {
-        return pastEncodedDeliveryVAA[keccak256(abi.encodePacked(chainId, deliveryVAASequence))];
+    function getPastDeliveryVAA(uint16 chainId, uint64 deliveryVAASequence)
+        public
+        view
+        returns (bytes memory)
+    {
+        return pastEncodedDeliveryVAA[keccak256(
+            abi.encodePacked(chainId, deliveryVAASequence)
+        )];
     }
 
-    function registerChain(uint16 chainId, address wormholeRelayerContractAddress, uint fork) public {
+    function registerChain(
+        uint16 chainId,
+        address wormholeRelayerContractAddress,
+        uint256 fork
+    ) public {
         wormholeRelayerContracts[chainId] = wormholeRelayerContractAddress;
         forks[chainId] = fork;
         chainIdFromFork[fork] = chainId;
@@ -62,43 +69,71 @@ contract MockOffchainRelayer {
         relay(vm.getRecordedLogs());
     }
 
-    function relay(Vm.Log[] memory logs) public {
-        relay(logs, bytes(""));
+    function relay(Vm.Log[] memory logs, bool debugLogging) public {
+        relay(logs, bytes(""), debugLogging);
     }
 
-    function vaaKeyMatchesVAA(
-        VaaKey memory vaaKey,
-        bytes memory signedVaa
-    ) internal view returns (bool) {
+    function relay(Vm.Log[] memory logs) public {
+        relay(logs, bytes(""), false);
+    }
+
+    function vaaKeyMatchesVAA(VaaKey memory vaaKey, bytes memory signedVaa)
+        internal
+        view
+        returns (bool)
+    {
         IWormhole.VM memory parsedVaa = relayerWormhole.parseVM(signedVaa);
         return (vaaKey.chainId == parsedVaa.emitterChainId)
             && (vaaKey.emitterAddress == parsedVaa.emitterAddress)
             && (vaaKey.sequence == parsedVaa.sequence);
     }
 
-    function relay(Vm.Log[] memory logs, bytes memory deliveryOverrides) public {
-       
+    function relay(
+        Vm.Log[] memory logs,
+        bytes memory deliveryOverrides,
+        bool debugLogging
+    ) public {
         uint16 chainId = chainIdFromFork[vm.activeFork()];
-        require(wormholeRelayerContracts[chainId] != address(0), "Chain not registered with MockOffchainRelayer");
+        require(
+            wormholeRelayerContracts[chainId] != address(0),
+            "Chain not registered with MockOffchainRelayer"
+        );
 
         vm.selectFork(forks[chainIdOfWormholeAndGuardianUtilities]);
 
-        Vm.Log[] memory entries = relayerWormholeSimulator.fetchWormholeMessageFromLog(logs);
+        Vm.Log[] memory entries =
+            relayerWormholeSimulator.fetchWormholeMessageFromLog(logs);
+
+        if (debugLogging) {
+            console.log("Found %s wormhole messages in logs", entries.length);
+        }
+
         bytes[] memory encodedVMs = new bytes[](entries.length);
         for (uint256 i = 0; i < encodedVMs.length; i++) {
-            encodedVMs[i] = relayerWormholeSimulator.fetchSignedMessageFromLogs(
-                entries[i], chainId
-            );
+            encodedVMs[i] =
+                relayerWormholeSimulator.fetchSignedMessageFromLogs(entries[i], chainId);
         }
         IWormhole.VM[] memory parsed = new IWormhole.VM[](encodedVMs.length);
         for (uint16 i = 0; i < encodedVMs.length; i++) {
             parsed[i] = relayerWormhole.parseVM(encodedVMs[i]);
         }
         for (uint16 i = 0; i < encodedVMs.length; i++) {
+            if (debugLogging) {
+                console.log(
+                    "Found VAA from chain %s emitted from %s",
+                    parsed[i].emitterChainId,
+                    fromWormholeFormat(parsed[i].emitterAddress)
+                );
+            }
+
             if (
-                parsed[i].emitterAddress == toWormholeFormat(wormholeRelayerContracts[chainId])
+                parsed[i].emitterAddress
+                    == toWormholeFormat(wormholeRelayerContracts[chainId])
                     && (parsed[i].emitterChainId == chainId)
             ) {
+                if (debugLogging) {
+                    console.log("Relaying VAA to chain %s", chainId);
+                }
                 genericRelay(encodedVMs[i], encodedVMs, parsed[i], deliveryOverrides);
             }
         }
@@ -107,7 +142,7 @@ contract MockOffchainRelayer {
     }
 
     function relay(bytes memory deliveryOverrides) public {
-        relay(vm.getRecordedLogs(), deliveryOverrides);
+        relay(vm.getRecordedLogs(), deliveryOverrides, false);
     }
 
     function setInfo(
@@ -131,8 +166,9 @@ contract MockOffchainRelayer {
         if (payloadId == 1) {
             DeliveryInstruction memory instruction =
                 decodeDeliveryInstruction(parsedDeliveryVAA.payload);
-            
-            bytes[] memory encodedVMsToBeDelivered = new bytes[](instruction.vaaKeys.length);
+
+            bytes[] memory encodedVMsToBeDelivered =
+                new bytes[](instruction.vaaKeys.length);
 
             for (uint8 i = 0; i < instruction.vaaKeys.length; i++) {
                 for (uint8 j = 0; j < encodedVMs.length; j++) {
@@ -142,19 +178,21 @@ contract MockOffchainRelayer {
                     }
                 }
             }
-            
+
             EvmExecutionInfoV1 memory executionInfo =
                 decodeEvmExecutionInfoV1(instruction.encodedExecutionInfo);
-               
-            uint256 budget = executionInfo.gasLimit * executionInfo.targetChainRefundPerGasUnused
-                + instruction.requestedReceiverValue  + instruction.extraReceiverValue;
+
+            uint256 budget = executionInfo.gasLimit
+                * executionInfo.targetChainRefundPerGasUnused
+                + instruction.requestedReceiverValue + instruction.extraReceiverValue;
 
             uint16 targetChain = instruction.targetChain;
-            
+
             vm.selectFork(forks[targetChain]);
-           
+
             vm.deal(address(this), budget);
 
+            vm.recordLogs();
             IWormholeRelayerDelivery(wormholeRelayerContracts[targetChain]).deliver{
                 value: budget
             }(
@@ -163,17 +201,16 @@ contract MockOffchainRelayer {
                 payable(address(this)),
                 deliveryOverrides
             );
-            
+
             setInfo(
                 parsedDeliveryVAA.emitterChainId,
                 parsedDeliveryVAA.sequence,
                 encodedVMsToBeDelivered,
                 encodedDeliveryVAA
             );
-            
         } else if (payloadId == 2) {
             RedeliveryInstruction memory instruction =
-                 decodeRedeliveryInstruction(parsedDeliveryVAA.payload);
+                decodeRedeliveryInstruction(parsedDeliveryVAA.payload);
 
             DeliveryOverride memory deliveryOverride = DeliveryOverride({
                 newExecutionInfo: instruction.newEncodedExecutionInfo,
@@ -183,7 +220,8 @@ contract MockOffchainRelayer {
 
             EvmExecutionInfoV1 memory executionInfo =
                 decodeEvmExecutionInfoV1(instruction.newEncodedExecutionInfo);
-            uint256 budget = executionInfo.gasLimit * executionInfo.targetChainRefundPerGasUnused
+            uint256 budget = executionInfo.gasLimit
+                * executionInfo.targetChainRefundPerGasUnused
                 + instruction.newRequestedReceiverValue;
 
             bytes memory oldEncodedDeliveryVAA = getPastDeliveryVAA(
@@ -211,4 +249,3 @@ contract MockOffchainRelayer {
 
     receive() external payable {}
 }
-
